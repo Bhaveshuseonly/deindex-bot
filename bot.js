@@ -189,7 +189,7 @@ async function handleMonitor(interaction) {
 
   if (sub === 'add') {
     const url = normalizeUrl(interaction.options.getString('url'));
-    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: interaction.channelId, urls: {} };
+    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: null, urls: {} };
 
     const gData = monitorData[interaction.guildId];
     const urlCount = Object.keys(gData.urls).length;
@@ -209,7 +209,6 @@ async function handleMonitor(interaction) {
       addedAt    : Date.now(),
       lastChecked: Date.now()
     };
-    if (!gData.notifyChannelId) gData.notifyChannelId = interaction.channelId;
     saveMonitorData(monitorData);
 
     // If already deindexed on add → send instant alert to notification channel
@@ -223,10 +222,11 @@ async function handleMonitor(interaction) {
       }
     }
 
-        await interaction.editReply({
+    await interaction.editReply({
       embeds: [new EmbedBuilder().setColor(0x00CC66).setDescription(`✅ Started monitoring\n\`${url}\``)]
     });
     return;
+  }
 
   if (sub === 'addmany') {
     const raw  = interaction.options.getString('urls');
@@ -235,9 +235,8 @@ async function handleMonitor(interaction) {
     if (!urls.length)
       return interaction.reply({ content: '❌ No valid URLs found. Paste one URL per line.', ephemeral: true });
 
-    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: interaction.channelId, urls: {} };
+    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: null, urls: {} };
     const gData2 = monitorData[interaction.guildId];
-    if (!gData2.notifyChannelId) gData2.notifyChannelId = interaction.channelId;
 
     const slotsLeft = MAX_URLS_PER_GUILD - Object.keys(gData2.urls).length;
     if (slotsLeft <= 0)
@@ -266,13 +265,14 @@ async function handleMonitor(interaction) {
     }
     saveMonitorData(monitorData);
 
-        const added = lines.filter(l => !l.startsWith('⚠️')).length;
+    const added = lines.filter(l => !l.startsWith('⚠️')).length;
     const skipped = urls.length - toAdd.length;
     const skippedNote = skipped ? ` (${skipped} skipped — slot limit)` : '';
     await interaction.editReply({
       embeds: [new EmbedBuilder().setColor(0x00CC66)
         .setDescription(`✅ Started monitoring ${added} URL(s)${skippedNote}`)]
-    }); return;
+    });
+    return;
   }
 
   if (sub === 'remove') {
