@@ -247,7 +247,7 @@ async function handleMonitor(interaction) {
     if (!urls.length)
       return interaction.reply({ content: '❌ No valid URLs found. Paste one URL per line.', ephemeral: true });
 
-    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: interaction.channelId: urls: {} };
+    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: interaction.channelId, urls: {} };
     const gData2 = monitorData[interaction.guildId];
     if (!gData2.notifyChannelId) gData2.notifyChannelId = interaction.channelId;
 
