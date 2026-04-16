@@ -201,6 +201,7 @@ async function handleMonitor(interaction) {
 
     await interaction.deferReply({ ephemeral: true });
 
+    // Do an initial check to record baseline status
     const result = await checkIndexed(url);
     gData.urls[url] = {
       status     : result.indexed,
@@ -210,6 +211,7 @@ async function handleMonitor(interaction) {
     };
     saveMonitorData(monitorData);
 
+    // If already deindexed on add → send instant alert to notification channel
     if (result.indexed === false) {
       const alertChannel = await client.channels.fetch(gData.notifyChannelId).catch(() => null);
       if (alertChannel) {
@@ -253,6 +255,7 @@ async function handleMonitor(interaction) {
       const icon = res.indexed === null ? '⚠️' : res.indexed ? '🟢' : '🔴';
       lines.push(icon + ' `' + u + '`');
 
+      // Instant alert if already deindexed on add
       if (res.indexed === false && alertChannel2) {
         const alertEmbed = new EmbedBuilder()
           .setColor(0xFF4444)
@@ -287,7 +290,7 @@ async function handleMonitor(interaction) {
     });
   }
 
-  if (sub === 'removeall') {
+  if (sub === 'removeall' || sub === 'clear') {
     const gData = monitorData[interaction.guildId];
     const count = gData ? Object.keys(gData.urls).length : 0;
     if (!count)
@@ -360,6 +363,7 @@ async function runMonitorCycle() {
     if (!channel) continue;
 
     for (const [url, info] of Object.entries(gData.urls)) {
+      // stagger requests
       await new Promise(r => setTimeout(r, 1500));
 
       const result = await checkIndexed(url);
@@ -367,6 +371,7 @@ async function runMonitorCycle() {
       info.status      = result.indexed;
       info.lastChecked = Date.now();
 
+      // Alert only when: was indexed (true) → now deindexed (false)
       if (prevStatus === true && result.indexed === false) {
         const alertEmbed = new EmbedBuilder()
           .setColor(0xFF4444)
@@ -374,6 +379,7 @@ async function runMonitorCycle() {
         await channel.send({ content: '@here', embeds: [alertEmbed] }).catch(console.error);
       }
 
+      // Also alert when: was deindexed (false) → now indexed (true) (re-indexed!)
       if (prevStatus === false && result.indexed === true) {
         const recoverEmbed = new EmbedBuilder()
           .setColor(0x00CC66)
@@ -398,10 +404,10 @@ async function handleHelp(interaction) {
         { name: '`/monitor add <url>`',          value: 'Add a single URL to 12h monitoring'                  },
         { name: '`/monitor addmany <urls>`',   value: 'Add multiple URLs at once — paste them all in'       },
         { name: '`/monitor remove <url>`',     value: 'Stop monitoring a URL'                               },
-        { name: '`/monitor removeall`',        value: 'Remove all monitored URLs at once'                   },
         { name: '`/monitor list`',             value: 'Show all monitored URLs and their status'            },
         { name: '`/monitor setchannel`',       value: 'Set current channel as alert destination'            },
-        { name: '`/monitor testnotify`',       value: 'Send a test alert to see what deindex noti looks like' }
+        { name: '`/monitor testnotify`',       value: 'Send a test alert to see what deindex noti looks like' },
+        { name: '`/monitor removeall` / `/monitor clear`', value: 'Remove all monitored URLs at once' }
       ).setTimestamp()],
     ephemeral: true
   });
@@ -418,10 +424,11 @@ async function registerCommands() {
       .addStringOption(o => o.setName('urls').setDescription('URLs separated by newlines, spaces, or commas').setRequired(true)))
     .addSubcommand(sub => sub.setName('remove').setDescription('Stop monitoring a URL')
       .addStringOption(o => o.setName('url').setDescription('URL to remove').setRequired(true)))
-    .addSubcommand(sub => sub.setName('removeall').setDescription('Remove all monitored URLs at once'))
     .addSubcommand(sub => sub.setName('list').setDescription('List all monitored URLs'))
     .addSubcommand(sub => sub.setName('setchannel').setDescription('Set this channel as the alert destination'))
-    .addSubcommand(sub => sub.setName('testnotify').setDescription('Send a test deindex alert to the notification channel'));
+    .addSubcommand(sub => sub.setName('testnotify').setDescription('Send a test deindex alert to the notification channel'))
+    .addSubcommand(sub => sub.setName('removeall').setDescription('Remove all monitored URLs at once'))
+    .addSubcommand(sub => sub.setName('clear').setDescription('Clear all monitored URLs (same as removeall)'));
 
   const cmds = [
     new SlashCommandBuilder().setName('check').setDescription('Check if a URL is indexed by Google')
@@ -442,10 +449,11 @@ client.once('clientReady', async () => {
   client.user.setActivity('/check <url>', { type: 3 });
   await registerCommands();
 
+  // Start monitor cycle immediately, then repeat every 12h
   setTimeout(async () => {
     await runMonitorCycle();
     setInterval(runMonitorCycle, CHECK_INTERVAL);
-  }, 60 * 1000);
+  }, 60 * 1000); // wait 1 min after startup before first cycle
 });
 
 client.on('interactionCreate', async interaction => {
