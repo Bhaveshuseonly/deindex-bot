@@ -100,27 +100,15 @@ async function checkIndexed(url) {
 
 // ── embed / buttons ────────────────────────────────────────────────────────
 function buildEmbed(url, result) {
-  const { indexed, method, error } = result;
-  const isErr  = indexed === null;
-  const color  = isErr ? 0xFFAA00 : indexed ? 0x00CC66 : 0xFF4444;
-  const icon   = isErr ? '⚠️'    : indexed ? '🟢'     : '🔴';
-  const label  = isErr ? 'ERROR' : indexed ? 'INDEXED' : 'DEINDEXED';
-
-  return new EmbedBuilder()
-    .setColor(color)
-    .setTitle(`${icon} ${label}`)
-    .setDescription('**URL:** `' + url + '`')
-    .addFields({
-      name  : '🔍 Google',
-      value : isErr
-        ? `⚠️ ${error}`
-        : indexed
-          ? `✅ Indexed\n*${method}*`
-          : `❌ Not indexed\n*${method}*`,
-      inline: true
-    })
-    .setTimestamp()
-    .setFooter({ text: 'DeIndex Checker • Serper.dev' });
+  const { indexed, error } = result;
+  const isErr = indexed === null;
+  const color = isErr ? 0xFFAA00 : indexed ? 0x00CC66 : 0xFF4444;
+  const desc  = isErr
+    ? `⚠️ **Error**\n\`${url}\`\n${error}`
+    : indexed
+      ? `🟢 **Indexed**\n\`${url}\``
+      : `🔴 **Deindexed**\n\`${url}\``;
+  return new EmbedBuilder().setColor(color).setDescription(desc);
 }
 
 function buildButtons(result) {
