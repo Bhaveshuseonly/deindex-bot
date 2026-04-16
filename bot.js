@@ -215,14 +215,32 @@ async function handleMonitor(interaction) {
     if (!gData.notifyChannelId) gData.notifyChannelId = interaction.channelId;
     saveMonitorData(monitorData);
 
+    // If already deindexed on add → send instant alert to notification channel
+    if (result.indexed === false) {
+      const alertChannel = await client.channels.fetch(gData.notifyChannelId).catch(() => null);
+      if (alertChannel) {
+        const alertEmbed = new EmbedBuilder()
+          .setColor(0xFF4444)
+          .setTitle('🚨 URL DEINDEXED!')
+          .setDescription(`This URL is **not in Google's index**.\n\n**URL:** \`${url}\`\n*${result.method}*`)
+          .addFields(
+            { name: '🔍 Check manually', value: `[Google site: search](${result.siteSearchUrl})`, inline: true },
+            { name: '📅 Detected at',    value: `<t:${Math.floor(Date.now() / 1000)}:F>`,         inline: true }
+          )
+          .setTimestamp()
+          .setFooter({ text: 'DeIndex Checker Monitor' });
+        await alertChannel.send({ content: '@here', embeds: [alertEmbed] }).catch(console.error);
+      }
+    }
+
     const statusLine = result.indexed === null
       ? '⚠️ Could not check status (will retry in 12h)'
       : result.indexed
-        ? '🟢 Currently **INDEXED**'
-        : '🔴 Currently **DEINDEXED** (will alert immediately if it changes)';
+        ? '🟢 Currently **INDEXED** — will notify if deindexed'
+        : '🔴 Currently **DEINDEXED** — alert sent to <#' + gData.notifyChannelId + '>';
 
     await interaction.editReply({
-      embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('👁️ Now monitoring')
+      embeds: [new EmbedBuilder().setColor(result.indexed === false ? 0xFF4444 : 0x5865F2).setTitle('👁️ Now monitoring')
         .setDescription('**URL:** `' + url + '`\n' + statusLine)
         .addFields({ name: '🔔 Alerts go to', value: `<#${gData.notifyChannelId}>` })
         .setFooter({ text: 'Checks every 12 hours' })]
@@ -248,6 +266,7 @@ async function handleMonitor(interaction) {
     const toAdd = urls.slice(0, slotsLeft);
     await interaction.deferReply({ ephemeral: true });
 
+    const alertChannel2 = await client.channels.fetch(gData2.notifyChannelId).catch(() => null);
     const lines = [];
     for (const u of toAdd) {
       if (gData2.urls[u]) { lines.push('⚠️ Already monitored: `' + u + '`'); continue; }
@@ -256,6 +275,21 @@ async function handleMonitor(interaction) {
       gData2.urls[u] = { status: res.indexed, addedBy: interaction.user.id, addedAt: Date.now(), lastChecked: Date.now() };
       const icon = res.indexed === null ? '⚠️' : res.indexed ? '🟢' : '🔴';
       lines.push(icon + ' `' + u + '`');
+
+      // Instant alert if already deindexed on add
+      if (res.indexed === false && alertChannel2) {
+        const alertEmbed = new EmbedBuilder()
+          .setColor(0xFF4444)
+          .setTitle('🚨 URL DEINDEXED!')
+          .setDescription(`This URL is **not in Google's index**.\n\n**URL:** \`${u}\`\n*${res.method}*`)
+          .addFields(
+            { name: '🔍 Check manually', value: `[Google site: search](${res.siteSearchUrl})`, inline: true },
+            { name: '📅 Detected at',    value: `<t:${Math.floor(Date.now() / 1000)}:F>`,       inline: true }
+          )
+          .setTimestamp()
+          .setFooter({ text: 'DeIndex Checker Monitor' });
+        await alertChannel2.send({ content: '@here', embeds: [alertEmbed] }).catch(console.error);
+      }
     }
     saveMonitorData(monitorData);
 
@@ -284,6 +318,33 @@ async function handleMonitor(interaction) {
     });
   }
 
+  if (sub === 'testnotify') {
+    const gData = monitorData[interaction.guildId];
+    const channelId = gData?.notifyChannelId || interaction.channelId;
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel)
+      return interaction.reply({ content: '❌ Alert channel not found. Run `/monitor setchannel` first.', ephemeral: true });
+
+    const fakeUrl = 'https://example.com/your-monitored-page';
+    const alertEmbed = new EmbedBuilder()
+      .setColor(0xFF4444)
+      .setTitle('🚨 URL DEINDEXED!')
+      .setDescription(`A monitored URL has been **removed from Google's index**.\n\n**URL:** \`${fakeUrl}\`\n*Domain not indexed*`)
+      .addFields(
+        { name: '🔍 Check manually', value: `[Google site: search](https://www.google.com/search?q=site:${fakeUrl})`, inline: true },
+        { name: '📅 Detected at',    value: `<t:${Math.floor(Date.now() / 1000)}:F>`,                                  inline: true }
+      )
+      .setTimestamp()
+      .setFooter({ text: 'DeIndex Checker Monitor • TEST ALERT' });
+
+    await channel.send({ content: '@here ⚠️ **[TEST]** This is what a deindex alert looks like:', embeds: [alertEmbed] });
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(0x00CC66).setTitle('✅ Test alert sent!')
+        .setDescription(`Check <#${channelId}> to see the deindex notification.`)],
+      ephemeral: true
+    });
+  }
+
   if (sub === 'list') {
     const gData = monitorData[interaction.guildId];
     if (!gData || !Object.keys(gData.urls).length)
@@ -302,7 +363,7 @@ async function handleMonitor(interaction) {
       .setTitle('👁️ Monitored URLs')
       .setDescription(lines.join('\n\n'))
       .addFields({ name: '🔔 Alert channel', value: gData.notifyChannelId ? `<#${gData.notifyChannelId}>` : 'Not set' })
-      .setFooter({ text: `${Object.keys(gData.urls).length}/${MAX_URLS_PER_GUILD} slots used • Checks every 12h` });
+      .setFooter({ text: `${Object.keys(gData.urls).length}/${MAX_URLS_PER_GUIDD} slots used • Checks every 12h` });
 
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
@@ -366,7 +427,7 @@ async function runMonitorCycle() {
   console.log('[Monitor] Cycle complete.');
 }
 
-// ── /help ──────────────────────────────────────────────────────────────────
+// ── /help ─────────────────────────────────────────────────────────────────
 async function handleHelp(interaction) {
   await interaction.reply({
     embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('📖 Help')
@@ -377,7 +438,8 @@ async function handleHelp(interaction) {
         { name: '`/monitor addmany <urls>`',   value: 'Add multiple URLs at once — paste them all in'       },
         { name: '`/monitor remove <url>`',     value: 'Stop monitoring a URL'                               },
         { name: '`/monitor list`',             value: 'Show all monitored URLs and their status'            },
-        { name: '`/monitor setchannel`',       value: 'Set current channel as alert destination'            }
+        { name: '`/monitor setchannel`',       value: 'Set current channel as alert destination'            },
+        { name: '`/monitor testnotify`',       value: 'Send a test alert to see what deindex noti looks like' }
       ).setTimestamp()],
     ephemeral: true
   });
@@ -395,7 +457,8 @@ async function registerCommands() {
     .addSubcommand(sub => sub.setName('remove').setDescription('Stop monitoring a URL')
       .addStringOption(o => o.setName('url').setDescription('URL to remove').setRequired(true)))
     .addSubcommand(sub => sub.setName('list').setDescription('List all monitored URLs'))
-    .addSubcommand(sub => sub.setName('setchannel').setDescription('Set this channel as the alert destination'));
+    .addSubcommand(sub => sub.setName('setchannel').setDescription('Set this channel as the alert destination'))
+    .addSubcommand(sub => sub.setName('testnotify').setDescription('Send a test deindex alert to the notification channel'));
 
   const cmds = [
     new SlashCommandBuilder().setName('check').setDescription('Check if a URL is indexed by Google')
