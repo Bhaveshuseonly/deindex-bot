@@ -223,19 +223,10 @@ async function handleMonitor(interaction) {
       }
     }
 
-    const replyDesc = result.indexed === null
-      ? `⚠️ Could not check — added anyway, retrying in 12h\n\`${url}\``
-      : result.indexed
-        ? `✅ Started monitoring\n\`${url}\``
-        : `🔴 Already deindexed — alert sent to <#${gData.notifyChannelId}>\n\`${url}\``;
-
-    await interaction.editReply({
-      embeds: [new EmbedBuilder()
-        .setColor(result.indexed === false ? 0xFF4444 : result.indexed ? 0x00CC66 : 0xFFAA00)
-        .setDescription(replyDesc)]
+        await interaction.editReply({
+      embeds: [new EmbedBuilder().setColor(0x00CC66).setDescription(`✅ Started monitoring\n\`${url}\``)]
     });
     return;
-  }
 
   if (sub === 'addmany') {
     const raw  = interaction.options.getString('urls');
@@ -275,13 +266,13 @@ async function handleMonitor(interaction) {
     }
     saveMonitorData(monitorData);
 
+        const added = lines.filter(l => !l.startsWith('⚠️')).length;
     const skipped = urls.length - toAdd.length;
-    const desc = lines.join('\n') + (skipped ? '\n\n⚠️ ' + skipped + ' URL(s) skipped (slot limit)' : '');
+    const skippedNote = skipped ? ` (${skipped} skipped — slot limit)` : '';
     await interaction.editReply({
-      embeds: [new EmbedBuilder().setColor(0x5865F2)
-        .setDescription(desc + `\n\n🔔 Alerts → <#${gData2.notifyChannelId}>`)]
-    });
-    return;
+      embeds: [new EmbedBuilder().setColor(0x00CC66)
+        .setDescription(`✅ Started monitoring ${added} URL(s)${skippedNote}`)]
+    }); return;
   }
 
   if (sub === 'remove') {
