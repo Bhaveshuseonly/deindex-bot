@@ -1,12 +1,18 @@
 const {
   Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder,
-  REST, Routes, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder
+  REST, Routes, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  AttachmentBuilder, PermissionFlagsBits
 } = require('discord.js');
 const https = require('https');
+const fs   = require('fs');
 
-const TOKEN        = process.env.BOT_TOKEN;
-const SERPER_KEY   = process.env.SERPER_API_KEY;
-const CLIENT_ID    = '1494232422743806042';
+const TOKEN      = process.env.BOT_TOKEN;
+const SERPER_KEY = process.env.SERPER_API_KEY;
+const CLIENT_ID  = '1494232422743806042';
+
+const MONITOR_FILE     = './monitor.json';
+const CHECK_INTERVAL   = 12 * 60 * 60 * 1000; // 12 hours
+const MAX_URLS_PER_GUILD = 20;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -21,17 +27,31 @@ function getDomain(urlStr) {
   catch { return urlStr; }
 }
 
+// ── monitor storage ────────────────────────────────────────────────────────
+function loadMonitorData() {
+  try {
+    if (fs.existsSync(MONITOR_FILE))
+      return JSON.parse(fs.readFileSync(MONITOR_FILE, 'utf8'));
+  } catch (e) { console.error('Monitor load error:', e.message); }
+  return {};
+}
+function saveMonitorData(data) {
+  try { fs.writeFileSync(MONITOR_FILE, JSON.stringify(data, null, 2)); }
+  catch (e) { console.error('Monitor save error:', e.message); }
+}
+let monitorData = loadMonitorData();
+
 // ── Serper.dev search ──────────────────────────────────────────────────────
 function serperSearch(query) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ q: query, gl: 'us', hl: 'en', num: 10 });
     const req  = https.request({
-      hostname : 'google.serper.dev',
-      path     : '/search',
-      method   : 'POST',
-      headers  : {
-        'X-API-KEY'    : SERPER_KEY,
-        'Content-Type' : 'application/json',
+      hostname: 'google.serper.dev',
+      path    : '/search',
+      method  : 'POST',
+      headers : {
+        'X-API-KEY'     : SERPER_KEY,
+        'Content-Type'  : 'application/json',
         'Content-Length': Buffer.byteLength(body)
       }
     }, (res) => {
@@ -50,22 +70,19 @@ function serperSearch(query) {
 
 // ── index check logic ──────────────────────────────────────────────────────
 async function checkIndexed(url) {
-  const domain      = getDomain(url);
+  const domain        = getDomain(url);
   const siteSearchUrl = 'https://www.google.com/search?q=' + encodeURIComponent('site:' + url);
-  const cacheUrl    = 'https://webcache.googleusercontent.com/search?q=cache:' + encodeURIComponent(url);
+  const cacheUrl      = 'https://webcache.googleusercontent.com/search?q=cache:' + encodeURIComponent(url);
 
   try {
-    // 1) site:exact-URL
     const r1 = await serperSearch('site:' + url);
     if (r1.organic && r1.organic.length > 0)
       return { indexed: true,  method: 'site:URL found',     siteSearchUrl, cacheUrl };
 
-    // 2) site:domain – see if Google knows the domain at all
     const r2 = await serperSearch('site:' + domain);
     if (!r2.organic || r2.organic.length === 0)
       return { indexed: false, method: 'Domain not indexed', siteSearchUrl, cacheUrl };
 
-    // Domain indexed but this page is not
     return { indexed: false, method: 'Page not indexed',   siteSearchUrl, cacheUrl };
   } catch (e) {
     return { indexed: null, error: e.message, siteSearchUrl, cacheUrl };
@@ -82,15 +99,15 @@ function buildEmbed(url, result) {
 
   return new EmbedBuilder()
     .setColor(color)
-    .setTitle(`${icon} ${label}`)
+    .setTitle(icon + ' ' + label)
     .setDescription('**URL:** `' + url + '`')
     .addFields({
       name  : '🔍 Google',
       value : isErr
-        ? `⚠️ ${error}`
+        ? '⚠️ ' + error
         : indexed
-          ? `✅ Indexed\n*${method}*`
-          : `❌ Not indexed\n*${method}*`,
+          ? '✅ Indexed\n*' + method + '*'
+          : '❌ Not indexed\n*' + method + '*',
       inline: true
     })
     .setTimestamp()
@@ -106,7 +123,7 @@ function buildButtons(result) {
   return row.components.length ? [row] : [];
 }
 
-// ── command handlers ───────────────────────────────────────────────────────
+// ── /check ─────────────────────────────────────────────────────────────────
 async function handleCheck(interaction) {
   const url = normalizeUrl(interaction.options.getString('url'));
   await interaction.deferReply();
@@ -114,6 +131,7 @@ async function handleCheck(interaction) {
   await interaction.editReply({ embeds: [buildEmbed(url, result)], components: buildButtons(result) });
 }
 
+// ── /bulkcheck ─────────────────────────────────────────────────────────────
 async function handleBulkCheck(interaction) {
   const urls = interaction.options.getString('urls')
     .split(/[\n,\s]+/).map(u => u.trim()).filter(Boolean).slice(0, 10);
@@ -157,12 +175,163 @@ async function handleBulkCheck(interaction) {
   });
 }
 
+// ── /monitor ───────────────────────────────────────────────────────────────
+async function handleMonitor(interaction) {
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'setchannel') {
+    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: null, urls: {} };
+    monitorData[interaction.guildId].notifyChannelId = interaction.channelId;
+    saveMonitorData(monitorData);
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(0x00CC66).setTitle('✅ Notification channel set')
+        .setDescription("I'll send deindex alerts here.")],
+      ephemeral: true
+    });
+  }
+
+  if (sub === 'add') {
+    const url = normalizeUrl(interaction.options.getString('url'));
+    if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: interaction.channelId, urls: {} };
+
+    const gData    = monitorData[interaction.guildId];
+    const urlCount = Object.keys(gData.urls).length;
+
+    if (urlCount >= MAX_URLS_PER_GUILD)
+      return interaction.reply({ content: '❌ Max ' + MAX_URLS_PER_GUILD + ' URLs per server. Remove one first.', ephemeral: true });
+    if (gData.urls[url])
+      return interaction.reply({ content: '⚠️ That URL is already being monitored.', ephemeral: true });
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const result = await checkIndexed(url);
+    gData.urls[url] = {
+      status     : result.indexed,
+      addedBy    : interaction.user.id,
+      addedAt    : Date.now(),
+      lastChecked: Date.now()
+    };
+    if (!gData.notifyChannelId) gData.notifyChannelId = interaction.channelId;
+    saveMonitorData(monitorData);
+
+    const statusLine = result.indexed === null
+      ? '⚠️ Could not check status (will retry in 12h)'
+      : result.indexed
+        ? '🟢 Currently **INDEXED**'
+        : '🔴 Currently **DEINDEXED** (will alert immediately if it changes)';
+
+    await interaction.editReply({
+      embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('👁️ Now monitoring')
+        .setDescription('**URL:** `' + url + '`\n' + statusLine)
+        .addFields({ name: '🔔 Alerts go to', value: '<#' + gData.notifyChannelId + '>' })
+        .setFooter({ text: 'Checks every 12 hours' })]
+    });
+    return;
+  }
+
+  if (sub === 'remove') {
+    const url   = normalizeUrl(interaction.options.getString('url'));
+    const gData = monitorData[interaction.guildId];
+    if (!gData || !gData.urls[url])
+      return interaction.reply({ content: "❌ That URL isn't being monitored.", ephemeral: true });
+
+    delete gData.urls[url];
+    saveMonitorData(monitorData);
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(0xFF4444).setTitle('🗑️ Removed')
+        .setDescription('No longer monitoring `' + url + '`')],
+      ephemeral: true
+    });
+  }
+
+  if (sub === 'list') {
+    const gData = monitorData[interaction.guildId];
+    if (!gData || !Object.keys(gData.urls).length)
+      return interaction.reply({ content: '📋 No URLs are being monitored yet. Use `/monitor add <url>`.', ephemeral: true });
+
+    const lines = Object.entries(gData.urls).map(([url, info]) => {
+      const icon        = info.status === null ? '⚠️' : info.status ? '🟢' : '🔴';
+      const lastChecked = info.lastChecked ? '<t:' + Math.floor(info.lastChecked / 1000) + ':R>' : 'never';
+      return icon + ' `' + url + '`\nLast checked: ' + lastChecked;
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('👁️ Monitored URLs')
+      .setDescription(lines.join('\n\n'))
+      .addFields({ name: '🔔 Alert channel', value: gData.notifyChannelId ? '<#' + gData.notifyChannelId + '>' : 'Not set' })
+      .setFooter({ text: Object.keys(gData.urls).length + '/' + MAX_URLS_PER_GUILD + ' slots used • Checks every 12h' });
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+}
+
+// ── background monitor loop ────────────────────────────────────────────────
+async function runMonitorCycle() {
+  const guilds = Object.keys(monitorData);
+  if (!guilds.length) return;
+
+  console.log('[Monitor] Running check cycle for ' + guilds.length + ' guild(s)…');
+
+  for (const guildId of guilds) {
+    const gData = monitorData[guildId];
+    if (!gData.notifyChannelId || !Object.keys(gData.urls).length) continue;
+
+    const channel = await client.channels.fetch(gData.notifyChannelId).catch(() => null);
+    if (!channel) continue;
+
+    for (const [url, info] of Object.entries(gData.urls)) {
+      await new Promise(r => setTimeout(r, 1500));
+
+      const result     = await checkIndexed(url);
+      const prevStatus = info.status;
+      info.status      = result.indexed;
+      info.lastChecked = Date.now();
+
+      if (prevStatus === true && result.indexed === false) {
+        const alertEmbed = new EmbedBuilder()
+          .setColor(0xFF4444)
+          .setTitle('🚨 URL DEINDEXED!')
+          .setDescription("A monitored URL has been **removed from Google's index**.\n\n**URL:** `" + url + "`\n*" + result.method + '*')
+          .addFields(
+            { name: '🔍 Check manually', value: '[Google site: search](' + result.siteSearchUrl + ')', inline: true },
+            { name: '📅 Detected at',    value: '<t:' + Math.floor(Date.now() / 1000) + ':F>',        inline: true }
+          )
+          .setTimestamp()
+          .setFooter({ text: 'DeIndex Checker Monitor' });
+
+        await channel.send({ content: '@here', embeds: [alertEmbed] }).catch(console.error);
+      }
+
+      if (prevStatus === false && result.indexed === true) {
+        const recoverEmbed = new EmbedBuilder()
+          .setColor(0x00CC66)
+          .setTitle('✅ URL RE-INDEXED!')
+          .setDescription("A previously deindexed URL is **back in Google's index**.\n\n**URL:** `" + url + '`')
+          .setTimestamp()
+          .setFooter({ text: 'DeIndex Checker Monitor' });
+
+        await channel.send({ embeds: [recoverEmbed] }).catch(console.error);
+      }
+    }
+
+    saveMonitorData(monitorData);
+  }
+
+  console.log('[Monitor] Cycle complete.');
+}
+
+// ── /help ──────────────────────────────────────────────────────────────────
 async function handleHelp(interaction) {
   await interaction.reply({
     embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('📖 Help')
       .addFields(
-        { name: '`/check <url>`',    value: 'Check a single URL' },
-        { name: '`/bulkcheck <urls>`', value: 'Check up to 10 URLs + .txt report' }
+        { name: '`/check <url>`',          value: 'Check if a single URL is indexed'                 },
+        { name: '`/bulkcheck <urls>`',     value: 'Check up to 10 URLs + .txt report'               },
+        { name: '`/monitor add <url>`',    value: 'Add a URL to 12h monitoring (alerts on deindex)' },
+        { name: '`/monitor remove <url>`', value: 'Stop monitoring a URL'                           },
+        { name: '`/monitor list`',         value: 'Show all monitored URLs and their status'        },
+        { name: '`/monitor setchannel`',   value: 'Set current channel as alert destination'        }
       ).setTimestamp()],
     ephemeral: true
   });
@@ -170,12 +339,23 @@ async function handleHelp(interaction) {
 
 // ── register slash commands ────────────────────────────────────────────────
 async function registerCommands() {
+  const monitorCmd = new SlashCommandBuilder()
+    .setName('monitor')
+    .setDescription('Monitor URLs and get alerted when they get deindexed')
+    .addSubcommand(sub => sub.setName('add').setDescription('Start monitoring a URL')
+      .addStringOption(o => o.setName('url').setDescription('URL to monitor').setRequired(true)))
+    .addSubcommand(sub => sub.setName('remove').setDescription('Stop monitoring a URL')
+      .addStringOption(o => o.setName('url').setDescription('URL to remove').setRequired(true)))
+    .addSubcommand(sub => sub.setName('list').setDescription('List all monitored URLs'))
+    .addSubcommand(sub => sub.setName('setchannel').setDescription('Set this channel as the alert destination'));
+
   const cmds = [
     new SlashCommandBuilder().setName('check').setDescription('Check if a URL is indexed by Google')
       .addStringOption(o => o.setName('url').setDescription('URL to check').setRequired(true)),
     new SlashCommandBuilder().setName('bulkcheck').setDescription('Check up to 10 URLs')
       .addStringOption(o => o.setName('urls').setDescription('URLs (newline/comma/space separated, max 10)').setRequired(true)),
     new SlashCommandBuilder().setName('help').setDescription('How to use DeIndex Checker'),
+    monitorCmd,
   ].map(c => c.toJSON());
 
   await new REST({ version: '10' }).setToken(TOKEN).put(Routes.applicationCommands(CLIENT_ID), { body: cmds });
@@ -187,6 +367,11 @@ client.once('clientReady', async () => {
   console.log('Online as ' + client.user.tag);
   client.user.setActivity('/check <url>', { type: 3 });
   await registerCommands();
+
+  setTimeout(async () => {
+    await runMonitorCycle();
+    setInterval(runMonitorCycle, CHECK_INTERVAL);
+  }, 60 * 1000);
 });
 
 client.on('interactionCreate', async interaction => {
@@ -194,6 +379,7 @@ client.on('interactionCreate', async interaction => {
   try {
     if      (interaction.commandName === 'check')     await handleCheck(interaction);
     else if (interaction.commandName === 'bulkcheck') await handleBulkCheck(interaction);
+    else if (interaction.commandName === 'monitor')   await handleMonitor(interaction);
     else if (interaction.commandName === 'help')      await handleHelp(interaction);
   } catch (err) {
     console.error('Interaction error:', err);
