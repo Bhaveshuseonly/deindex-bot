@@ -77,13 +77,22 @@ async function checkIndexed(url) {
   try {
     const r1 = await serperSearch('site:' + url);
     if (r1.organic && r1.organic.length > 0)
-      return { indexed: true,  method: 'site:URL found',     siteSearchUrl, cacheUrl };
+      return { indexed: true, method: 'site:URL found', siteSearchUrl, cacheUrl };
+
+    // If URL has query params, also try without them (Google site: ignores query strings)
+    let baseUrl = url;
+    try { baseUrl = new URL(url).origin + new URL(url).pathname; } catch {}
+    if (baseUrl !== url) {
+      const r1b = await serperSearch('site:' + baseUrl);
+      if (r1b.organic && r1b.organic.length > 0)
+        return { indexed: true, method: 'site:path found', siteSearchUrl, cacheUrl };
+    }
 
     const r2 = await serperSearch('site:' + domain);
     if (!r2.organic || r2.organic.length === 0)
       return { indexed: false, method: 'Domain not indexed', siteSearchUrl, cacheUrl };
 
-    return { indexed: false, method: 'Page not indexed',   siteSearchUrl, cacheUrl };
+    return { indexed: false, method: 'Page not indexed', siteSearchUrl, cacheUrl };
   } catch (e) {
     return { indexed: null, error: e.message, siteSearchUrl, cacheUrl };
   }
