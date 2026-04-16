@@ -117,9 +117,9 @@ function buildEmbed(url, result) {
 function buildButtons(result) {
   const row = new ActionRowBuilder();
   if (result.siteSearchUrl)
-    row.addComponents(new ButtonBuilder().setLabel('Google site:').setStyle(ButtonStyle.Link).setURL(result.siteSearchUrl).setEmoji('ð'));
+    row.addComponents(new ButtonBuilder().setLabel('Google site:').setStyle(ButtonStyle.Link).setURL(result.siteSearchUrl));
   if (result.cacheUrl)
-    row.addComponents(new ButtonBuilder().setLabel('Google Cache').setStyle(ButtonStyle.Link).setURL(result.cacheUrl).setEmoji('ð¾'));
+    row.addComponents(new ButtonBuilder().setLabel('Google Cache').setStyle(ButtonStyle.Link).setURL(result.cacheUrl));
   return row.components.length ? [row] : [];
 }
 
