@@ -84,6 +84,76 @@ function serperSearch(query) {
   });
 }
 
+// ── Lumen Database lookup ──────────────────────────────────────────────────
+// Public DMCA/takedown notice archive. When Google deindexes a URL for legal
+// reasons, Google (usually) files a copy of the notice with Lumen. We hit
+// their public JSON API to surface complainant, copyrighted source, and
+// infringing-url claims.
+function lumenGet(pathWithQuery) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'lumendatabase.org',
+      path    : pathWithQuery,
+      method  : 'GET',
+      headers : {
+        'Accept'    : 'application/json',
+        'User-Agent': 'DeIndexChecker/1.0 (Discord bot)'
+      }
+    }, (res) => {
+      res.setEncoding('utf8');
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300)
+          return reject(new Error('Lumen HTTP ' + res.statusCode));
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error('Lumen: invalid JSON')); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(20000, () => { req.destroy(new Error('timeout')); });
+    req.end();
+  });
+}
+
+async function lumenLookup(url) {
+  try {
+    // Try phrase-quoted URL first; fall back to unquoted if empty.
+    let search = await lumenGet('/notices/search.json?per_page=3&term=' + encodeURIComponent('"' + url + '"'));
+    let hits = search.notices || [];
+    if (!hits.length) {
+      search = await lumenGet('/notices/search.json?per_page=3&term=' + encodeURIComponent(url));
+      hits = search.notices || [];
+    }
+    if (!hits.length) return { found: false };
+
+    const detail = await lumenGet('/notices/' + hits[0].id + '.json');
+    // Lumen returns { dmca: {...} } or { trademark: {...} }, keyed by type.
+    const notice = detail.notice || Object.values(detail)[0] || {};
+
+    const works = (notice.works || []).map(w => ({
+      description     : w.description || '',
+      copyrighted_urls: (w.copyrighted_urls || []).map(u => u.url).filter(Boolean),
+      infringing_urls : (w.infringing_urls  || []).map(u => u.url).filter(Boolean)
+    }));
+
+    return {
+      found    : true,
+      id       : notice.id,
+      title    : notice.title,
+      sender   : notice.sender_name,
+      principal: notice.principal_name,
+      recipient: notice.recipient_name,
+      date     : notice.date_received,
+      topics   : notice.topics || [],
+      works,
+      noticeUrl: 'https://lumendatabase.org/notices/' + notice.id
+    };
+  } catch (e) {
+    return { found: false, error: e.message };
+  }
+}
+
 // ── index check logic ──────────────────────────────────────────────────────
 async function checkIndexed(url) {
   const domain      = getDomain(url);
@@ -186,6 +256,104 @@ async function handleBulkCheck(interaction) {
       ).setTimestamp().setFooter({ text: 'DeIndex Checker' })],
     files: [new AttachmentBuilder(Buffer.from(report.join('\n'), 'utf8'), { name: 'deindex-report.txt' })],
     components: []
+  });
+}
+
+// ── /data ──────────────────────────────────────────────────────────────────
+async function handleData(interaction) {
+  const urls = interaction.options.getString('urls')
+    .split(/[\n,\s]+/).map(u => u.trim()).filter(Boolean).slice(0, 10);
+
+  if (!urls.length) return interaction.reply({ content: '❌ No valid URLs found.', flags: MessageFlags.Ephemeral });
+
+  await interaction.deferReply();
+  await interaction.editReply({
+    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Looking up Lumen notices…')
+      .setDescription('Checking **' + urls.length + '** URL(s) against lumendatabase.org…').setTimestamp()]
+  });
+
+  let withNotice = 0, withoutNotice = 0, errors = 0;
+  const embedLines = [];
+  const reportSections = [];
+
+  for (let i = 0; i < urls.length; i++) {
+    const url = normalizeUrl(urls[i]);
+    const r   = await lumenLookup(url);
+
+    if (r.error) {
+      errors++;
+      embedLines.push('⚠️ `' + url + '` — ' + r.error);
+      reportSections.push('─────\n' + url + '\nERROR: ' + r.error);
+    } else if (!r.found) {
+      withoutNotice++;
+      embedLines.push('⚪ `' + url + '` — no Lumen notice');
+      reportSections.push([
+        '─────',
+        url,
+        'No Lumen notice found.',
+        'Possible reasons this URL is not in Lumen:',
+        '  • Deindexed for non-legal reasons (thin content, spam, manual action)',
+        '  • Blocked by robots.txt or <meta name="robots" content="noindex">',
+        '  • Not actually deindexed — just not ranking',
+        '  • Legal request that Google did not publish to Lumen'
+      ].join('\n'));
+    } else {
+      withNotice++;
+      const dateShort = r.date ? String(r.date).slice(0, 10) : '';
+      embedLines.push('🔴 `' + url + '` — ' + (r.sender || 'unknown') + (dateShort ? ' (' + dateShort + ')' : ''));
+
+      const worksText = r.works.length ? r.works.map((w, n) => {
+        const lines = ['Work ' + (n + 1) + ':'];
+        if (w.description)              lines.push('  Description     : ' + w.description);
+        if (w.copyrighted_urls.length)  lines.push('  Copyrighted URLs (claimant owns):\n    ' + w.copyrighted_urls.join('\n    '));
+        if (w.infringing_urls.length)   lines.push('  Infringing URLs  (takedown targets):\n    ' + w.infringing_urls.join('\n    '));
+        return lines.join('\n');
+      }).join('\n\n') : '(no works listed)';
+
+      reportSections.push([
+        '─────',
+        url,
+        'Lumen notice: ' + r.noticeUrl,
+        'Title       : ' + (r.title     || '(none)'),
+        'Date        : ' + (r.date      || '(unknown)'),
+        'Sender      : ' + (r.sender    || '(unknown)'),
+        'Principal   : ' + (r.principal || '(n/a)'),
+        'Recipient   : ' + (r.recipient || '(unknown)'),
+        'Topics      : ' + (r.topics.length ? r.topics.join(', ') : '(none)'),
+        '',
+        worksText
+      ].join('\n'));
+    }
+
+    if (i < urls.length - 1) await new Promise(r => setTimeout(r, 600));
+  }
+
+  const report = [
+    '=== DeIndex Lumen Data Report ===',
+    'Date : ' + new Date().toUTCString(),
+    'Total: ' + urls.length,
+    'With notice   : ' + withNotice,
+    'Without notice: ' + withoutNotice,
+    'Errors        : ' + errors,
+    '',
+    ...reportSections
+  ];
+
+  // Discord embed description cap is 4096 chars.
+  let desc = embedLines.join('\n');
+  if (desc.length > 3900) desc = desc.slice(0, 3900) + '\n… (truncated — see attached report)';
+
+  await interaction.editReply({
+    embeds: [new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('📄 Lumen Data Report')
+      .setDescription(desc || '(no results)')
+      .addFields(
+        { name: '🔴 Has notice', value: String(withNotice),    inline: true },
+        { name: '⚪ No notice',  value: String(withoutNotice), inline: true },
+        { name: '⚠️ Errors',     value: String(errors),        inline: true }
+      ).setTimestamp().setFooter({ text: 'DeIndex Checker • lumendatabase.org' })],
+    files: [new AttachmentBuilder(Buffer.from(report.join('\n'), 'utf8'), { name: 'deindex-lumen-report.txt' })]
   });
 }
 
@@ -422,6 +590,7 @@ async function handleHelp(interaction) {
       .addFields(
         { name: '`/check <url>`',              value: 'Check if a single URL is indexed'                     },
         { name: '`/bulkcheck <urls>`',         value: 'Check up to 10 URLs + .txt report'                   },
+        { name: '`/data <urls>`',              value: 'Lumen Database lookup — why a URL was taken down, complainant, source URLs' },
         { name: '`/monitor add <url>`',          value: 'Add a single URL to 12h monitoring'                  },
         { name: '`/monitor addmany <urls>`',   value: 'Add multiple URLs at once — paste them all in'       },
         { name: '`/monitor remove <url>`',     value: 'Stop monitoring a URL'                               },
@@ -456,6 +625,8 @@ async function registerCommands() {
       .addStringOption(o => o.setName('url').setDescription('URL to check').setRequired(true)),
     new SlashCommandBuilder().setName('bulkcheck').setDescription('Check up to 10 URLs')
       .addStringOption(o => o.setName('urls').setDescription('URLs (newline/comma/space separated, max 10)').setRequired(true)),
+    new SlashCommandBuilder().setName('data').setDescription('Lumen Database lookup — takedown reason, complainant, source URLs')
+      .addStringOption(o => o.setName('urls').setDescription('URLs (newline/comma/space separated, max 10)').setRequired(true)),
     new SlashCommandBuilder().setName('help').setDescription('How to use DeIndex Checker'),
     monitorCmd,
   ].map(c => c.toJSON());
@@ -482,6 +653,7 @@ client.on('interactionCreate', async interaction => {
   try {
     if      (interaction.commandName === 'check')     await handleCheck(interaction);
     else if (interaction.commandName === 'bulkcheck') await handleBulkCheck(interaction);
+    else if (interaction.commandName === 'data')      await handleData(interaction);
     else if (interaction.commandName === 'monitor')   await handleMonitor(interaction);
     else if (interaction.commandName === 'help')      await handleHelp(interaction);
   } catch (err) {
