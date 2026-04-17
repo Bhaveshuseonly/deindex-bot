@@ -178,10 +178,44 @@ function lumenSplitBy(html, tag, cls) {
 
 // Parse a user-supplied token into a Lumen notice ID.
 // Accepts: "18484002", "/notices/18484002", "https://lumendatabase.org/notices/18484002"
+// Does NOT match arbitrary URLs that happen to contain digits — we want to
+// fall back to URL→notice lookup for those.
 function lumenParseId(raw) {
   if (!raw) return null;
-  const m = String(raw).match(/(\d{4,})/);
-  return m ? m[1] : null;
+  const s = String(raw).trim();
+  if (/^\d{4,}$/.test(s)) return s;
+  const m1 = s.match(/lumendatabase\.org\/notices\/(\d+)/i);
+  if (m1) return m1[1];
+  const m2 = s.match(/^\/?notices\/(\d+)/i);
+  if (m2) return m2[1];
+  return null;
+}
+
+// Best-effort: given a website URL, try to surface a Lumen notice ID from
+// Google's SERP via Serper. When Google deindexes a URL for DMCA, its SERP
+// sometimes includes a link to the Lumen notice — Serper may expose it in
+// the raw response. Returns a notice ID string or null.
+async function findLumenNoticeForUrl(rawUrl) {
+  let hostname;
+  try { hostname = new URL(rawUrl).hostname.replace(/^www\./, ''); } catch { return null; }
+  const path = (() => { try { return new URL(rawUrl).pathname; } catch { return ''; } })();
+
+  const queries = [
+    '"' + rawUrl + '"',
+    '"' + hostname + path + '"',
+    'site:' + hostname + ' "' + path.split('/').filter(Boolean).pop() + '"',
+  ].filter(q => q && !q.includes('""'));
+
+  for (const q of queries) {
+    try {
+      const r = await serperSearch(q);
+      const blob = JSON.stringify(r);
+      const m = blob.match(/lumendatabase\.org\\?\/notices\\?\/(\d+)/i);
+      if (m) return m[1];
+    } catch { /* continue */ }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null;
 }
 
 async function lumenLookup(idOrUrl) {
@@ -370,23 +404,24 @@ async function handleBulkCheck(interaction) {
 }
 
 // ── /data ──────────────────────────────────────────────────────────────────
-// Accepts Lumen notice IDs or notice URLs, e.g.
-//   18484002
-//   https://lumendatabase.org/notices/18484002
-// (Lumen search is captcha-gated, so we can't take arbitrary website URLs.
-//  You can find the notice ID from Google's DMCA disclosure on a SERP —
-//  the "Complaint" / "LumenDatabase.org" link in the footer of results.)
+// Accepts either Lumen notice IDs or website URLs.
+//   • Notice ID  → fetched directly from lumendatabase.org
+//   • Notice URL → https://lumendatabase.org/notices/<id>
+//   • Website URL → best-effort Serper SERP scan for a Lumen link.
+//                   If Serper doesn't surface one, reply with a clear
+//                   "paste the notice ID" hint (Lumen's own search is
+//                   captcha-gated now, so auto-lookup can't be guaranteed).
 async function handleData(interaction) {
-  const tokens = interaction.options.getString('ids')
+  const tokens = interaction.options.getString('input')
     .split(/[\n,\s]+/).map(u => u.trim()).filter(Boolean).slice(0, 10);
 
-  if (!tokens.length) return interaction.reply({ content: '❌ No Lumen notice IDs found.', flags: MessageFlags.Ephemeral });
+  if (!tokens.length) return interaction.reply({ content: '❌ No input.', flags: MessageFlags.Ephemeral });
 
   await interaction.deferReply();
-  const etaSec = Math.ceil(tokens.length * 4);
+  const etaSec = Math.ceil(tokens.length * 6);
   await interaction.editReply({
-    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Fetching Lumen notices…')
-      .setDescription('Fetching **' + tokens.length + '** notice(s) from lumendatabase.org…\n_Paced to avoid rate-limits (~' + etaSec + 's)._')
+    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Looking up Lumen notices…')
+      .setDescription('Processing **' + tokens.length + '** input(s)…\n_URLs are looked up via Google; notice IDs are fetched directly. (~' + etaSec + 's)._')
       .setTimestamp()]
   });
 
@@ -396,19 +431,47 @@ async function handleData(interaction) {
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
-    const r = await lumenLookup(token);
-    const label = '`' + token + '`';
+    const label = '`' + (token.length > 60 ? token.slice(0, 57) + '…' : token) + '`';
+
+    // Resolve the token to a notice ID — either directly or via Serper.
+    let id = lumenParseId(token);
+    let resolvedViaUrl = false;
+    if (!id) {
+      const looksUrl = /^https?:\/\//i.test(token) || /\.[a-z]{2,}(?:\/|$)/i.test(token);
+      if (looksUrl) {
+        const url = normalizeUrl(token);
+        id = await findLumenNoticeForUrl(url);
+        resolvedViaUrl = !!id;
+        if (!id) {
+          badInput++;
+          embedLines.push('⚪ ' + label + ' — no Lumen notice found via Google');
+          reportSections.push([
+            '─────',
+            token,
+            'No Lumen notice auto-discoverable for this URL.',
+            'Possible reasons:',
+            '  • Google no longer surfaces the DMCA disclosure in its API',
+            '  • URL was deindexed for non-legal reasons (thin content, spam, manual action)',
+            '  • Not actually deindexed — just not ranking',
+            'To look up anyway: find the notice ID from Google\'s SERP footer ("Complaint" link) and paste it here.'
+          ].join('\n'));
+          if (i < tokens.length - 1) await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+      } else {
+        badInput++;
+        embedLines.push('⚪ ' + label + ' — not a URL or notice ID');
+        reportSections.push('─────\n' + token + '\nSkipped: not a URL or Lumen notice ID.');
+        continue;
+      }
+    }
+
+    const r = await lumenLookup(id);
 
     if (r.error && !r.found) {
-      if (/not a Lumen notice ID/.test(r.error)) {
-        badInput++;
-        embedLines.push('⚪ ' + label + ' — not a Lumen notice ID');
-        reportSections.push('─────\n' + token + '\nSkipped: not a Lumen notice ID.');
-      } else {
-        errors++;
-        embedLines.push('⚠️ ' + label + ' — ' + r.error);
-        reportSections.push('─────\n' + token + '\nERROR: ' + r.error);
-      }
+      errors++;
+      embedLines.push('⚠️ ' + label + ' — ' + r.error);
+      reportSections.push('─────\n' + token + '\nERROR: ' + r.error);
     } else if (!r.found) {
       errors++;
       embedLines.push('⚠️ ' + label + ' — notice not found');
@@ -416,7 +479,8 @@ async function handleData(interaction) {
     } else {
       ok++;
       const dateShort = r.date ? String(r.date).slice(0, 10) : '';
-      embedLines.push('🔴 `#' + r.id + '` — ' + (r.sender || 'unknown') + (dateShort ? ' (' + dateShort + ')' : ''));
+      const prefix = resolvedViaUrl ? label + ' → ' : '';
+      embedLines.push('🔴 ' + prefix + '`#' + r.id + '` — ' + (r.sender || 'unknown') + (dateShort ? ' (' + dateShort + ')' : ''));
 
       const worksText = r.works.length ? r.works.map((w, n) => {
         const lines = ['Work ' + (n + 1) + ':'];
@@ -710,7 +774,7 @@ async function handleHelp(interaction) {
       .addFields(
         { name: '`/check <url>`',              value: 'Check if a single URL is indexed'                     },
         { name: '`/bulkcheck <urls>`',         value: 'Check up to 10 URLs + .txt report'                   },
-        { name: '`/data <ids>`',               value: 'Lumen notice lookup — paste notice ID(s) or `lumendatabase.org/notices/<id>` URL(s). Find the ID from Google\'s DMCA disclosure on a SERP.' },
+        { name: '`/data <input>`',             value: 'Lumen notice lookup. Paste URLs (auto-resolved via Google) or Lumen notice IDs. If a URL can\'t be auto-resolved, find the notice ID from Google\'s DMCA disclosure ("Complaint" link on the SERP) and paste it.' },
         { name: '`/monitor add <url>`',          value: 'Add a single URL to 12h monitoring'                  },
         { name: '`/monitor addmany <urls>`',   value: 'Add multiple URLs at once — paste them all in'       },
         { name: '`/monitor remove <url>`',     value: 'Stop monitoring a URL'                               },
@@ -745,8 +809,8 @@ async function registerCommands() {
       .addStringOption(o => o.setName('url').setDescription('URL to check').setRequired(true)),
     new SlashCommandBuilder().setName('bulkcheck').setDescription('Check up to 10 URLs')
       .addStringOption(o => o.setName('urls').setDescription('URLs (newline/comma/space separated, max 10)').setRequired(true)),
-    new SlashCommandBuilder().setName('data').setDescription('Lumen notice lookup — paste notice ID(s) or lumendatabase.org/notices/<id> URL(s)')
-      .addStringOption(o => o.setName('ids').setDescription('Lumen notice IDs or URLs (space/comma/newline separated, max 10)').setRequired(true)),
+    new SlashCommandBuilder().setName('data').setDescription('Lumen notice lookup — paste URLs or notice IDs')
+      .addStringOption(o => o.setName('input').setDescription('URLs or Lumen notice IDs (space/comma/newline separated, max 10)').setRequired(true)),
     new SlashCommandBuilder().setName('help').setDescription('How to use DeIndex Checker'),
     monitorCmd,
   ].map(c => c.toJSON());
