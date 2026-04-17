@@ -86,28 +86,41 @@ function serperSearch(query) {
 
 // ── Lumen Database lookup ──────────────────────────────────────────────────
 // Public DMCA/takedown notice archive. When Google deindexes a URL for legal
-// reasons, Google (usually) files a copy of the notice with Lumen. We hit
-// their public JSON API to surface complainant, copyrighted source, and
-// infringing-url claims.
-function lumenGet(pathWithQuery) {
+// reasons, Google (usually) files a copy of the notice with Lumen.
+//
+// Lumen's `.json` endpoints now return 403 to unauthenticated clients, so we
+// scrape their public HTML pages instead. Full infringing/copyrighted URLs
+// require a Lumen account — without it, HTML only exposes domain + count
+// (e.g. "example.com - 3 URLs"), which is still enough to identify who the
+// notice came from and what content is being claimed.
+function lumenGet(pathWithQuery, hops) {
+  hops = hops || 0;
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: 'lumendatabase.org',
       path    : pathWithQuery,
       method  : 'GET',
       headers : {
-        'Accept'    : 'application/json',
-        'User-Agent': 'DeIndexChecker/1.0 (Discord bot)'
+        'Accept'         : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent'     : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
       }
     }, (res) => {
+      // Follow up to 3 redirects (Lumen search 302s to /notices/search?term=… or /notices/<id>).
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && hops < 3) {
+        res.resume();
+        const next = res.headers.location.startsWith('http')
+          ? new URL(res.headers.location).pathname + (new URL(res.headers.location).search || '')
+          : res.headers.location;
+        return resolve(lumenGet(next, hops + 1));
+      }
       res.setEncoding('utf8');
       let data = '';
       res.on('data', c => { data += c; });
       res.on('end', () => {
         if (res.statusCode < 200 || res.statusCode >= 300)
           return reject(new Error('Lumen HTTP ' + res.statusCode));
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Lumen: invalid JSON')); }
+        resolve(data);
       });
     });
     req.on('error', reject);
@@ -116,38 +129,135 @@ function lumenGet(pathWithQuery) {
   });
 }
 
-async function lumenLookup(url) {
+// Strip HTML tags and decode common entities, collapse whitespace.
+function lumenCleanText(html) {
+  if (!html) return '';
+  return html
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g,  '<')
+    .replace(/&gt;/g,  '>')
+    .replace(/&quot;/g,'"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g,' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Pull the first substring inside <tag class="cls" …>…</tag> (non-greedy).
+function lumenFirstBlock(html, tag, cls) {
+  const re = new RegExp('<' + tag + '\\b[^>]*class="[^"]*\\b' + cls + '\\b[^"]*"[^>]*>([\\s\\S]*?)</' + tag + '>', 'i');
+  const m = html.match(re);
+  return m ? m[1] : '';
+}
+
+// Pull ALL substrings inside <tag class="cls" …>…</tag>.
+function lumenAllBlocks(html, tag, cls) {
+  const re = new RegExp('<' + tag + '\\b[^>]*class="[^"]*\\b' + cls + '\\b[^"]*"[^>]*>([\\s\\S]*?)</' + tag + '>', 'gi');
+  const out = [];
+  let m;
+  while ((m = re.exec(html)) !== null) out.push(m[1]);
+  return out;
+}
+
+// Split a container on <tag class="cls" …> boundaries. Needed for the works
+// list because each <li class="work"> contains nested <li class="…_url">
+// children, so the naive non-greedy "</tag>" match truncates too early.
+function lumenSplitBy(html, tag, cls) {
+  const re = new RegExp('<' + tag + '\\b[^>]*class="[^"]*\\b' + cls + '\\b[^"]*"[^>]*>', 'gi');
+  const starts = [];
+  let m;
+  while ((m = re.exec(html)) !== null) starts.push(m.index + m[0].length);
+  const chunks = [];
+  for (let i = 0; i < starts.length; i++) {
+    const end = (i + 1 < starts.length) ? starts[i + 1] : html.length;
+    chunks.push(html.slice(starts[i], end));
+  }
+  return chunks;
+}
+
+// Parse a user-supplied token into a Lumen notice ID.
+// Accepts: "18484002", "/notices/18484002", "https://lumendatabase.org/notices/18484002"
+function lumenParseId(raw) {
+  if (!raw) return null;
+  const m = String(raw).match(/(\d{4,})/);
+  return m ? m[1] : null;
+}
+
+async function lumenLookup(idOrUrl) {
+  const id = lumenParseId(idOrUrl);
+  if (!id) return { found: false, error: 'not a Lumen notice ID (expected e.g. 18484002 or lumendatabase.org/notices/18484002)' };
+
   try {
-    // Try phrase-quoted URL first; fall back to unquoted if empty.
-    let search = await lumenGet('/notices/search.json?per_page=3&term=' + encodeURIComponent('"' + url + '"'));
-    let hits = search.notices || [];
-    if (!hits.length) {
-      search = await lumenGet('/notices/search.json?per_page=3&term=' + encodeURIComponent(url));
-      hits = search.notices || [];
-    }
-    if (!hits.length) return { found: false };
+    // Fetch notice detail page directly. Lumen's search is captcha-gated so we
+    // require the notice ID up front (find it from Google's DMCA disclosure).
+    const html = await lumenGet('/notices/' + id);
 
-    const detail = await lumenGet('/notices/' + hits[0].id + '.json');
-    // Lumen returns { dmca: {...} } or { trademark: {...} }, keyed by type.
-    const notice = detail.notice || Object.values(detail)[0] || {};
+    // 3) Parse structured fields from HTML.
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+    const title      = titleMatch ? lumenCleanText(titleMatch[1]).replace(/\s*::\s*Notices\s*::\s*Lumen\s*$/i, '') : '';
 
-    const works = (notice.works || []).map(w => ({
-      description     : w.description || '',
-      copyrighted_urls: (w.copyrighted_urls || []).map(u => u.url).filter(Boolean),
-      infringing_urls : (w.infringing_urls  || []).map(u => u.url).filter(Boolean)
-    }));
+    const senderBlock    = lumenFirstBlock(html, 'section', 'sender');
+    const recipientBlock = lumenFirstBlock(html, 'section', 'recipient');
+    const worksBlock     = lumenFirstBlock(html, 'section', 'works');
+
+    const senderNameRaw    = lumenFirstBlock(senderBlock,    'h6', 'entity-name');
+    const recipientNameRaw = lumenFirstBlock(recipientBlock, 'h6', 'entity-name');
+    const sender    = lumenCleanText(senderNameRaw);
+    const recipient = lumenCleanText(recipientNameRaw);
+
+    // Date: <time datetime="2019-05-02T…">May 02, 2019</time>
+    const dateMatch = senderBlock.match(/<time[^>]*datetime="([^"]+)"/i);
+    const date      = dateMatch ? dateMatch[1].slice(0, 10) : '';
+
+    // Notice type: <dl class="notice-type">…<dd class="field">DMCA</dd></dl>
+    const noticeTypeBlock = lumenFirstBlock(html, 'dl', 'notice-type');
+    const noticeTypeField = lumenFirstBlock(noticeTypeBlock, 'dd', 'field');
+    const noticeType      = lumenCleanText(noticeTypeField);
+
+    // (Per-notice topics aren't reliably rendered on the public HTML page;
+    //  they're only exposed via the authenticated JSON API. Skipped.)
+
+    // Works: each <li class="work">…</li> inside the works section. Use
+    // boundary-split (not non-greedy </li>) because work items contain
+    // nested <li class="copyrighted_url" /> etc.
+    const workItems = worksBlock ? lumenSplitBy(worksBlock, 'li', 'work') : [];
+    const works = workItems.map(w => {
+      // Description: <div class="description">…<span class="field">TEXT</span></div>
+      const descBlock  = lumenFirstBlock(w, 'div', 'description');
+      const descField  = lumenFirstBlock(descBlock, 'span', 'field');
+      const description = lumenCleanText(descField);
+
+      // Kind: <div class="kind">…<span class="field">…</span></div>
+      const kindBlock  = lumenFirstBlock(w, 'div', 'kind');
+      const kindField  = lumenFirstBlock(kindBlock, 'span', 'field');
+      const kind       = lumenCleanText(kindField);
+
+      // Original (copyrighted) URLs: <ol class="list original-urls"><li class="copyrighted_url">…</li>…
+      const origBlock = lumenFirstBlock(w, 'ol', 'original-urls');
+      const copyrighted_urls = origBlock
+        ? lumenAllBlocks(origBlock, 'li', 'copyrighted_url').map(lumenCleanText).filter(Boolean)
+        : [];
+
+      // Infringing URLs: <ol class="list infringing-urls"><li class="infringing_url">…</li>…
+      const infBlock = lumenFirstBlock(w, 'ol', 'infringing-urls');
+      const infringing_urls = infBlock
+        ? lumenAllBlocks(infBlock, 'li', 'infringing_url').map(lumenCleanText).filter(Boolean)
+        : [];
+
+      return { description, kind, copyrighted_urls, infringing_urls };
+    });
 
     return {
       found    : true,
-      id       : notice.id,
-      title    : notice.title,
-      sender   : notice.sender_name,
-      principal: notice.principal_name,
-      recipient: notice.recipient_name,
-      date     : notice.date_received,
-      topics   : notice.topics || [],
+      id,
+      title,
+      sender,
+      recipient,
+      date,
+      noticeType,
       works,
-      noticeUrl: 'https://lumendatabase.org/notices/' + notice.id
+      noticeUrl: 'https://lumendatabase.org/notices/' + id
     };
   } catch (e) {
     return { found: false, error: e.message };
@@ -260,81 +370,91 @@ async function handleBulkCheck(interaction) {
 }
 
 // ── /data ──────────────────────────────────────────────────────────────────
+// Accepts Lumen notice IDs or notice URLs, e.g.
+//   18484002
+//   https://lumendatabase.org/notices/18484002
+// (Lumen search is captcha-gated, so we can't take arbitrary website URLs.
+//  You can find the notice ID from Google's DMCA disclosure on a SERP —
+//  the "Complaint" / "LumenDatabase.org" link in the footer of results.)
 async function handleData(interaction) {
-  const urls = interaction.options.getString('urls')
+  const tokens = interaction.options.getString('ids')
     .split(/[\n,\s]+/).map(u => u.trim()).filter(Boolean).slice(0, 10);
 
-  if (!urls.length) return interaction.reply({ content: '❌ No valid URLs found.', flags: MessageFlags.Ephemeral });
+  if (!tokens.length) return interaction.reply({ content: '❌ No Lumen notice IDs found.', flags: MessageFlags.Ephemeral });
 
   await interaction.deferReply();
+  const etaSec = Math.ceil(tokens.length * 4);
   await interaction.editReply({
-    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Looking up Lumen notices…')
-      .setDescription('Checking **' + urls.length + '** URL(s) against lumendatabase.org…').setTimestamp()]
+    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Fetching Lumen notices…')
+      .setDescription('Fetching **' + tokens.length + '** notice(s) from lumendatabase.org…\n_Paced to avoid rate-limits (~' + etaSec + 's)._')
+      .setTimestamp()]
   });
 
-  let withNotice = 0, withoutNotice = 0, errors = 0;
+  let ok = 0, badInput = 0, errors = 0;
   const embedLines = [];
   const reportSections = [];
 
-  for (let i = 0; i < urls.length; i++) {
-    const url = normalizeUrl(urls[i]);
-    const r   = await lumenLookup(url);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const r = await lumenLookup(token);
+    const label = '`' + token + '`';
 
-    if (r.error) {
-      errors++;
-      embedLines.push('⚠️ `' + url + '` — ' + r.error);
-      reportSections.push('─────\n' + url + '\nERROR: ' + r.error);
+    if (r.error && !r.found) {
+      if (/not a Lumen notice ID/.test(r.error)) {
+        badInput++;
+        embedLines.push('⚪ ' + label + ' — not a Lumen notice ID');
+        reportSections.push('─────\n' + token + '\nSkipped: not a Lumen notice ID.');
+      } else {
+        errors++;
+        embedLines.push('⚠️ ' + label + ' — ' + r.error);
+        reportSections.push('─────\n' + token + '\nERROR: ' + r.error);
+      }
     } else if (!r.found) {
-      withoutNotice++;
-      embedLines.push('⚪ `' + url + '` — no Lumen notice');
-      reportSections.push([
-        '─────',
-        url,
-        'No Lumen notice found.',
-        'Possible reasons this URL is not in Lumen:',
-        '  • Deindexed for non-legal reasons (thin content, spam, manual action)',
-        '  • Blocked by robots.txt or <meta name="robots" content="noindex">',
-        '  • Not actually deindexed — just not ranking',
-        '  • Legal request that Google did not publish to Lumen'
-      ].join('\n'));
+      errors++;
+      embedLines.push('⚠️ ' + label + ' — notice not found');
+      reportSections.push('─────\n' + token + '\nNotice not found on Lumen.');
     } else {
-      withNotice++;
+      ok++;
       const dateShort = r.date ? String(r.date).slice(0, 10) : '';
-      embedLines.push('🔴 `' + url + '` — ' + (r.sender || 'unknown') + (dateShort ? ' (' + dateShort + ')' : ''));
+      embedLines.push('🔴 `#' + r.id + '` — ' + (r.sender || 'unknown') + (dateShort ? ' (' + dateShort + ')' : ''));
 
       const worksText = r.works.length ? r.works.map((w, n) => {
         const lines = ['Work ' + (n + 1) + ':'];
-        if (w.description)              lines.push('  Description     : ' + w.description);
-        if (w.copyrighted_urls.length)  lines.push('  Copyrighted URLs (claimant owns):\n    ' + w.copyrighted_urls.join('\n    '));
-        if (w.infringing_urls.length)   lines.push('  Infringing URLs  (takedown targets):\n    ' + w.infringing_urls.join('\n    '));
+        if (w.kind)                    lines.push('  Kind            : ' + w.kind);
+        if (w.description)             lines.push('  Description     : ' + w.description);
+        if (w.copyrighted_urls.length) lines.push('  Copyrighted URLs (claimant owns):\n    ' + w.copyrighted_urls.join('\n    '));
+        if (w.infringing_urls.length)  lines.push('  Infringing URLs  (takedown targets):\n    ' + w.infringing_urls.join('\n    '));
         return lines.join('\n');
       }).join('\n\n') : '(no works listed)';
 
       reportSections.push([
         '─────',
-        url,
-        'Lumen notice: ' + r.noticeUrl,
-        'Title       : ' + (r.title     || '(none)'),
-        'Date        : ' + (r.date      || '(unknown)'),
-        'Sender      : ' + (r.sender    || '(unknown)'),
-        'Principal   : ' + (r.principal || '(n/a)'),
-        'Recipient   : ' + (r.recipient || '(unknown)'),
-        'Topics      : ' + (r.topics.length ? r.topics.join(', ') : '(none)'),
+        'Notice #' + r.id + ': ' + r.noticeUrl,
+        'Title       : ' + (r.title      || '(none)'),
+        'Notice type : ' + (r.noticeType || '(unknown)'),
+        'Date        : ' + (r.date       || '(unknown)'),
+        'Sender      : ' + (r.sender     || '(unknown)'),
+        'Recipient   : ' + (r.recipient  || '(unknown)'),
         '',
         worksText
       ].join('\n'));
     }
 
-    if (i < urls.length - 1) await new Promise(r => setTimeout(r, 600));
+    // Lumen rate-limits bursts. Keep pacing generous between notices.
+    if (i < tokens.length - 1) await new Promise(r => setTimeout(r, 2500));
   }
 
   const report = [
     '=== DeIndex Lumen Data Report ===',
-    'Date : ' + new Date().toUTCString(),
-    'Total: ' + urls.length,
-    'With notice   : ' + withNotice,
-    'Without notice: ' + withoutNotice,
-    'Errors        : ' + errors,
+    'Date         : ' + new Date().toUTCString(),
+    'Total        : ' + tokens.length,
+    'Fetched      : ' + ok,
+    'Bad input    : ' + badInput,
+    'Errors       : ' + errors,
+    '',
+    'Note: Lumen\'s public HTML shows domain + URL-count for copyrighted /',
+    'infringing URLs (e.g. "example.com - 3 URLs"). Full URLs require a',
+    'Lumen account. Sender / date / description / recipient are complete.',
     '',
     ...reportSections
   ];
@@ -349,9 +469,9 @@ async function handleData(interaction) {
       .setTitle('📄 Lumen Data Report')
       .setDescription(desc || '(no results)')
       .addFields(
-        { name: '🔴 Has notice', value: String(withNotice),    inline: true },
-        { name: '⚪ No notice',  value: String(withoutNotice), inline: true },
-        { name: '⚠️ Errors',     value: String(errors),        inline: true }
+        { name: '🔴 Fetched',   value: String(ok),       inline: true },
+        { name: '⚪ Bad input', value: String(badInput), inline: true },
+        { name: '⚠️ Errors',    value: String(errors),   inline: true }
       ).setTimestamp().setFooter({ text: 'DeIndex Checker • lumendatabase.org' })],
     files: [new AttachmentBuilder(Buffer.from(report.join('\n'), 'utf8'), { name: 'deindex-lumen-report.txt' })]
   });
@@ -590,7 +710,7 @@ async function handleHelp(interaction) {
       .addFields(
         { name: '`/check <url>`',              value: 'Check if a single URL is indexed'                     },
         { name: '`/bulkcheck <urls>`',         value: 'Check up to 10 URLs + .txt report'                   },
-        { name: '`/data <urls>`',              value: 'Lumen Database lookup — why a URL was taken down, complainant, source URLs' },
+        { name: '`/data <ids>`',               value: 'Lumen notice lookup — paste notice ID(s) or `lumendatabase.org/notices/<id>` URL(s). Find the ID from Google\'s DMCA disclosure on a SERP.' },
         { name: '`/monitor add <url>`',          value: 'Add a single URL to 12h monitoring'                  },
         { name: '`/monitor addmany <urls>`',   value: 'Add multiple URLs at once — paste them all in'       },
         { name: '`/monitor remove <url>`',     value: 'Stop monitoring a URL'                               },
@@ -625,8 +745,8 @@ async function registerCommands() {
       .addStringOption(o => o.setName('url').setDescription('URL to check').setRequired(true)),
     new SlashCommandBuilder().setName('bulkcheck').setDescription('Check up to 10 URLs')
       .addStringOption(o => o.setName('urls').setDescription('URLs (newline/comma/space separated, max 10)').setRequired(true)),
-    new SlashCommandBuilder().setName('data').setDescription('Lumen Database lookup — takedown reason, complainant, source URLs')
-      .addStringOption(o => o.setName('urls').setDescription('URLs (newline/comma/space separated, max 10)').setRequired(true)),
+    new SlashCommandBuilder().setName('data').setDescription('Lumen notice lookup — paste notice ID(s) or lumendatabase.org/notices/<id> URL(s)')
+      .addStringOption(o => o.setName('ids').setDescription('Lumen notice IDs or URLs (space/comma/newline separated, max 10)').setRequired(true)),
     new SlashCommandBuilder().setName('help').setDescription('How to use DeIndex Checker'),
     monitorCmd,
   ].map(c => c.toJSON());
