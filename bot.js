@@ -1,7 +1,7 @@
 const {
   Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder,
   REST, Routes, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  AttachmentBuilder, PermissionFlagsBits
+  AttachmentBuilder, PermissionFlagsBits, MessageFlags
 } = require('discord.js');
 const https = require('https');
 const fs   = require('fs');
@@ -10,9 +10,13 @@ const TOKEN      = process.env.BOT_TOKEN;
 const SERPER_KEY = process.env.SERPER_API_KEY;
 const CLIENT_ID  = '1494232422743806042';
 
-const MONITOR_FILE     = './monitor.json';
-const CHECK_INTERVAL   = 12 * 60 * 60 * 1000; // 12 hours
+const MONITOR_FILE       = './monitor.json';
+const CHECK_INTERVAL     = 12 * 60 * 60 * 1000; // 12 hours
 const MAX_URLS_PER_GUILD = 20;
+
+// Crash-safety: surface async errors instead of letting the process die silently.
+process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+process.on('uncaughtException',  err => console.error('Uncaught exception:',  err));
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -42,6 +46,8 @@ function saveMonitorData(data) {
 let monitorData = loadMonitorData();
 
 // ── Serper.dev search ──────────────────────────────────────────────────────
+// Rejects on HTTP/API failures so callers never mistake an API error for a
+// "not indexed" result.
 function serperSearch(query) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ q: query, gl: 'us', hl: 'en', num: 10 });
@@ -55,14 +61,24 @@ function serperSearch(query) {
         'Content-Length': Buffer.byteLength(body)
       }
     }, (res) => {
+      res.setEncoding('utf8');
       let data = '';
       res.on('data', c => { data += c; });
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve({}); }
+        let parsed;
+        try { parsed = JSON.parse(data); }
+        catch { return reject(new Error('Invalid JSON from Serper (HTTP ' + res.statusCode + ')')); }
+        if (parsed && parsed.message && parsed.statusCode && parsed.statusCode >= 400) {
+          return reject(new Error('Serper: ' + parsed.message));
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error('Serper HTTP ' + res.statusCode));
+        }
+        resolve(parsed);
       });
     });
     req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.setTimeout(15000, () => { req.destroy(new Error('timeout')); });
     req.write(body);
     req.end();
   });
@@ -72,12 +88,11 @@ function serperSearch(query) {
 async function checkIndexed(url) {
   const domain      = getDomain(url);
   const siteSearchUrl = 'https://www.google.com/search?q=' + encodeURIComponent('site:' + url);
-  const cacheUrl    = 'https://webcache.googleusercontent.com/search?q=cache:' + encodeURIComponent(url);
 
   try {
     const r1 = await serperSearch('site:' + url);
     if (r1.organic && r1.organic.length > 0)
-      return { indexed: true, method: 'site:URL found', siteSearchUrl, cacheUrl };
+      return { indexed: true, method: 'site:URL found', siteSearchUrl };
 
     // If URL has query params, also try without them (Google site: ignores query strings)
     let baseUrl = url;
@@ -85,16 +100,16 @@ async function checkIndexed(url) {
     if (baseUrl !== url) {
       const r1b = await serperSearch('site:' + baseUrl);
       if (r1b.organic && r1b.organic.length > 0)
-        return { indexed: true, method: 'site:path found', siteSearchUrl, cacheUrl };
+        return { indexed: true, method: 'site:path found', siteSearchUrl };
     }
 
     const r2 = await serperSearch('site:' + domain);
     if (!r2.organic || r2.organic.length === 0)
-      return { indexed: false, method: 'Domain not indexed', siteSearchUrl, cacheUrl };
+      return { indexed: false, method: 'Domain not indexed', siteSearchUrl };
 
-    return { indexed: false, method: 'Page not indexed', siteSearchUrl, cacheUrl };
+    return { indexed: false, method: 'Page not indexed', siteSearchUrl };
   } catch (e) {
-    return { indexed: null, error: e.message, siteSearchUrl, cacheUrl };
+    return { indexed: null, error: e.message, siteSearchUrl };
   }
 }
 
@@ -115,8 +130,7 @@ function buildButtons(result) {
   const row = new ActionRowBuilder();
   if (result.siteSearchUrl)
     row.addComponents(new ButtonBuilder().setLabel('Google site: search').setStyle(ButtonStyle.Link).setURL(result.siteSearchUrl));
-  if (result.cacheUrl)
-    row.addComponents(new ButtonBuilder().setLabel('Google Cache').setStyle(ButtonStyle.Link).setURL(result.cacheUrl));
+  // Google Cache was retired in early 2024; no button for it.
   return row.components.length ? [row] : [];
 }
 
@@ -132,40 +146,43 @@ async function handleCheck(interaction) {
 async function handleBulkCheck(interaction) {
   const urls = interaction.options.getString('urls')
     .split(/[\n,\s]+/).map(u => u.trim()).filter(Boolean).slice(0, 10);
-  if (!urls.length) return interaction.reply({ content: '❌ No valid URLs found.', ephemeral: true });
+
+  if (!urls.length) return interaction.reply({ content: '❌ No valid URLs found.', flags: MessageFlags.Ephemeral });
 
   await interaction.deferReply();
   await interaction.editReply({
-    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Checking...')
-      .setDescription('Checking **' + urls.length + '** URLs…').setTimestamp()]
+    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Checking...').setDescription('Checking **' + urls.length + '** URLs…').setTimestamp()]
   });
 
   let indexed = 0, deindexed = 0, errors = 0;
   const lines = [];
 
-  for (const raw of urls) {
-    const url    = normalizeUrl(raw);
+  for (let i = 0; i < urls.length; i++) {
+    const url = normalizeUrl(urls[i]);
     const result = await checkIndexed(url);
-    if (result.indexed === null) { errors++;    lines.push('⚠️ ERROR     | ' + url); }
-    else if (result.indexed)    { indexed++;   lines.push('🟢 INDEXED   | ' + url); }
-    else                        { deindexed++; lines.push('🔴 DEINDEXED | ' + url); }
-    await new Promise(r => setTimeout(r, 500));
+    if      (result.indexed === null) { errors++;    lines.push('⚠️ ERROR     | ' + url + ' | ' + (result.error || 'unknown')); }
+    else if (result.indexed)          { indexed++;   lines.push('🟢 INDEXED   | ' + url); }
+    else                              { deindexed++; lines.push('🔴 DEINDEXED | ' + url); }
+    if (i < urls.length - 1) await new Promise(r => setTimeout(r, 500));
   }
 
   const report = [
     '=== DeIndex Bulk Report ===',
     'Date: ' + new Date().toUTCString(),
-    'Total: ' + urls.length, '',
+    'Total: ' + urls.length,
+    '',
     ...lines
   ];
 
   await interaction.editReply({
-    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('📊 Bulk Complete')
+    embeds: [new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('📊 Bulk Complete')
       .setDescription('**Total:** ' + urls.length + ' URLs')
       .addFields(
         { name: '🟢 Indexed',   value: String(indexed),   inline: true },
         { name: '🔴 Deindexed', value: String(deindexed), inline: true },
-        { name: '⚠️ Errors',   value: String(errors),    inline: true }
+        { name: '⚠️ Errors',    value: String(errors),    inline: true }
       ).setTimestamp().setFooter({ text: 'DeIndex Checker' })],
     files: [new AttachmentBuilder(Buffer.from(report.join('\n'), 'utf8'), { name: 'deindex-report.txt' })],
     components: []
@@ -183,7 +200,7 @@ async function handleMonitor(interaction) {
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(0x00CC66).setTitle('✅ Notification channel set')
         .setDescription('I\'ll send deindex alerts here.')],
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
   }
 
@@ -195,16 +212,16 @@ async function handleMonitor(interaction) {
     const urlCount = Object.keys(gData.urls).length;
 
     if (urlCount >= MAX_URLS_PER_GUILD)
-      return interaction.reply({ content: `❌ Max ${MAX_URLS_PER_GUILD} URLs per server. Remove one first.`, ephemeral: true });
+      return interaction.reply({ content: `❌ Max ${MAX_URLS_PER_GUILD} URLs per server. Remove one first.`, flags: MessageFlags.Ephemeral });
     if (gData.urls[url])
-      return interaction.reply({ content: '⚠️ That URL is already being monitored.', ephemeral: true });
+      return interaction.reply({ content: '⚠️ That URL is already being monitored.', flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     // Do an initial check to record baseline status
     const result = await checkIndexed(url);
     gData.urls[url] = {
-      status     : result.indexed,
+      status     : result.indexed,   // may be null if API errored on add
       addedBy    : interaction.user.id,
       addedAt    : Date.now(),
       lastChecked: Date.now()
@@ -233,23 +250,24 @@ async function handleMonitor(interaction) {
     const urls = raw.split(/[\n,\s]+/).map(u => u.trim()).filter(u => u.startsWith('http') || u.includes('.')).map(normalizeUrl);
 
     if (!urls.length)
-      return interaction.reply({ content: '❌ No valid URLs found. Paste one URL per line.', ephemeral: true });
+      return interaction.reply({ content: '❌ No valid URLs found. Paste one URL per line.', flags: MessageFlags.Ephemeral });
 
     if (!monitorData[interaction.guildId]) monitorData[interaction.guildId] = { notifyChannelId: null, urls: {} };
     const gData2 = monitorData[interaction.guildId];
 
     const slotsLeft = MAX_URLS_PER_GUILD - Object.keys(gData2.urls).length;
     if (slotsLeft <= 0)
-      return interaction.reply({ content: `❌ No slots left (max ${MAX_URLS_PER_GUILD}). Remove some URLs first.`, ephemeral: true });
+      return interaction.reply({ content: `❌ No slots left (max ${MAX_URLS_PER_GUILD}). Remove some URLs first.`, flags: MessageFlags.Ephemeral });
 
     const toAdd = urls.slice(0, slotsLeft);
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const alertChannel2 = await client.channels.fetch(gData2.notifyChannelId).catch(() => null);
     const lines = [];
     for (const u of toAdd) {
       if (gData2.urls[u]) { lines.push('⚠️ Already monitored: `' + u + '`'); continue; }
       await new Promise(r => setTimeout(r, 800));
+
       const res = await checkIndexed(u);
       gData2.urls[u] = { status: res.indexed, addedBy: interaction.user.id, addedAt: Date.now(), lastChecked: Date.now() };
       const icon = res.indexed === null ? '⚠️' : res.indexed ? '🟢' : '🔴';
@@ -279,14 +297,14 @@ async function handleMonitor(interaction) {
     const url = normalizeUrl(interaction.options.getString('url'));
     const gData = monitorData[interaction.guildId];
     if (!gData || !gData.urls[url])
-      return interaction.reply({ content: '❌ That URL isn\'t being monitored.', ephemeral: true });
+      return interaction.reply({ content: '❌ That URL isn\'t being monitored.', flags: MessageFlags.Ephemeral });
 
     delete gData.urls[url];
     saveMonitorData(monitorData);
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(0xFF4444).setTitle('🗑️ Removed')
         .setDescription('No longer monitoring `' + url + '`')],
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
   }
 
@@ -294,13 +312,13 @@ async function handleMonitor(interaction) {
     const gData = monitorData[interaction.guildId];
     const count = gData ? Object.keys(gData.urls).length : 0;
     if (!count)
-      return interaction.reply({ content: '📋 No URLs are being monitored.', ephemeral: true });
+      return interaction.reply({ content: '📋 No URLs are being monitored.', flags: MessageFlags.Ephemeral });
 
     gData.urls = {};
     saveMonitorData(monitorData);
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(0xFF4444).setDescription(`🗑️ Removed all ${count} URL(s) from monitoring`)],
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
   }
 
@@ -309,7 +327,7 @@ async function handleMonitor(interaction) {
     const channelId = gData?.notifyChannelId || interaction.channelId;
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel)
-      return interaction.reply({ content: '❌ Alert channel not found. Run `/monitor setchannel` first.', ephemeral: true });
+      return interaction.reply({ content: '❌ Alert channel not found. Run `/monitor setchannel` first.', flags: MessageFlags.Ephemeral });
 
     const fakeUrl = 'https://example.com/your-monitored-page';
     const alertEmbed = new EmbedBuilder()
@@ -320,14 +338,14 @@ async function handleMonitor(interaction) {
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(0x00CC66).setTitle('✅ Test alert sent!')
         .setDescription(`Check <#${channelId}> to see the deindex notification.`)],
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
   }
 
   if (sub === 'list') {
     const gData = monitorData[interaction.guildId];
     if (!gData || !Object.keys(gData.urls).length)
-      return interaction.reply({ content: '📋 No URLs are being monitored yet. Use `/monitor add <url>`.', ephemeral: true });
+      return interaction.reply({ content: '📋 No URLs are being monitored yet. Use `/monitor add <url>`.', flags: MessageFlags.Ephemeral });
 
     const lines = Object.entries(gData.urls).map(([url, info]) => {
       const icon = info.status === null ? '⚠️' : info.status ? '🟢' : '🔴';
@@ -344,7 +362,7 @@ async function handleMonitor(interaction) {
       .addFields({ name: '🔔 Alert channel', value: gData.notifyChannelId ? `<#${gData.notifyChannelId}>` : 'Not set' })
       .setFooter({ text: `${Object.keys(gData.urls).length}/${MAX_URLS_PER_GUILD} slots used • Checks every 12h` });
 
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -367,20 +385,23 @@ async function runMonitorCycle() {
       await new Promise(r => setTimeout(r, 1500));
 
       const result = await checkIndexed(url);
+
       const prevStatus = info.status;
-      info.status      = result.indexed;
+      // Only overwrite status when we have a real result. On API error keep
+      // last-known status so a Serper hiccup doesn't look like a deindex.
+      if (result.indexed !== null) {
+        info.status = result.indexed;
+      }
       info.lastChecked = Date.now();
 
-      // Alert only when: was indexed (true) → now deindexed (false)
-      if (prevStatus === true && result.indexed === false) {
+      // Alerts only fire on confirmed transitions (ignore null/error results).
+      if (result.indexed !== null && prevStatus === true && result.indexed === false) {
         const alertEmbed = new EmbedBuilder()
           .setColor(0xFF4444)
           .setDescription(`🔴 **Deindexed**\n\`${url}\`\n[Check on Google](${result.siteSearchUrl})`);
         await channel.send({ content: '@here', embeds: [alertEmbed] }).catch(console.error);
       }
-
-      // Also alert when: was deindexed (false) → now indexed (true) (re-indexed!)
-      if (prevStatus === false && result.indexed === true) {
+      if (result.indexed !== null && prevStatus === false && result.indexed === true) {
         const recoverEmbed = new EmbedBuilder()
           .setColor(0x00CC66)
           .setDescription(`🟢 **Re-indexed**\n\`${url}\``);
@@ -409,7 +430,7 @@ async function handleHelp(interaction) {
         { name: '`/monitor testnotify`',       value: 'Send a test alert to see what deindex noti looks like' },
         { name: '`/monitor removeall` / `/monitor clear`', value: 'Remove all monitored URLs at once' }
       ).setTimestamp()],
-    ephemeral: true
+    flags: MessageFlags.Ephemeral
   });
 }
 
@@ -465,10 +486,13 @@ client.on('interactionCreate', async interaction => {
     else if (interaction.commandName === 'help')      await handleHelp(interaction);
   } catch (err) {
     console.error('Interaction error:', err);
-    const msg = { content: '❌ Unexpected error.', ephemeral: true };
+    const msg = { content: '❌ Unexpected error.', flags: MessageFlags.Ephemeral };
     if (interaction.deferred) await interaction.editReply(msg).catch(() => {});
     else                      await interaction.reply(msg).catch(() => {});
   }
 });
 
-client.login(TOKEN);
+client.login(TOKEN).catch(err => {
+  console.error('Login failed:', err);
+  process.exit(1);
+});
